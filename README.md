@@ -55,6 +55,10 @@ Every inbound request is assigned a 32-char hex `X-Request-ID` by Nginx. That ID
 | `rabbitmq` | rabbitmq:3.12-management-alpine | 1 | `localhost:15672` (management UI) |
 | `payment-db` | postgres:16-alpine | 1 | internal only |
 | `invoice-db` | postgres:16-alpine | 1 | internal only |
+| `prometheus` | prom/prometheus:v2.48.0 | 1 | `localhost:9090` |
+| `loki` | grafana/loki:2.9.3 | 1 | internal only |
+| `promtail` | grafana/promtail:2.9.3 | 1 | internal only |
+| `grafana` | grafana/grafana:10.2.3 | 1 | `localhost:3000` |
 
 All services share the `app-net` Docker bridge network. Only Nginx and the RabbitMQ management UI are reachable from the host.
 
@@ -215,6 +219,16 @@ Nginx access logs are also JSON-formatted so the full request path is observable
 ├── .env.example
 ├── nginx/
 │   └── nginx.conf
+├── prometheus/
+│   └── prometheus.yml
+├── loki/
+│   └── loki-config.yml
+├── promtail/
+│   └── promtail-config.yml
+├── grafana/
+│   └── provisioning/
+│       └── datasources/
+│           └── datasources.yml
 ├── payment-api/
 │   ├── Dockerfile
 │   ├── pom.xml
@@ -249,18 +263,85 @@ Configured in `.env` (copy from `.env.example`):
 | `PAYMENT_DB_USER` / `PAYMENT_DB_PASSWORD` | payment-db, payment-api |
 | `INVOICE_DB_USER` / `INVOICE_DB_PASSWORD` | invoice-db, invoice-api |
 | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | rabbitmq, payment-api, invoice-api |
+| `GRAFANA_USER` / `GRAFANA_PASSWORD` | grafana |
 
 Each application container also receives `INSTANCE_ID` (e.g. `payment-api-1`) from Compose, which is embedded in every log line to identify which replica produced it.
 
 ---
 
-## Observability Readiness (Phase 2)
+## Observability Stack
 
-The codebase is intentionally prepared for a second phase without requiring code changes:
+```
+METRICS PIPELINE
+  payment-api-1/2 :8080/actuator/prometheus ─┐
+  invoice-api-1/2 :8080/actuator/prometheus ─┴──► Prometheus ──► Grafana
+                                               (scrapes every 15s) (PromQL)
 
-- Spring Boot Actuator + Micrometer Prometheus endpoint exposed at `/actuator/prometheus`
-- Every metric tagged with `service` and `instance` labels for per-replica Grafana filtering
-- All logs are JSON on stdout — ready for Promtail → Loki scraping
-- Nginx access logs use the same JSON format for Promtail ingestion
+LOGS PIPELINE
+  All container stdout (JSON) ──► Promtail ──► Loki ──► Grafana
+                                  (Docker socket  (stores    (LogQL)
+                                   discovery)      by label)
+```
 
-Phase 2 will add: Prometheus, Loki + Promtail, Grafana, and optionally OpenTelemetry tracing.
+- **Prometheus** scrapes `/actuator/prometheus` from all four application instances every 15 seconds. Every metric is tagged with `service` and `instance` labels so you can filter by individual replica.
+- **Promtail** tails all container logs via the Docker socket, attaches `service` and `container` labels from the Compose metadata, and ships the raw log lines to Loki.
+- **Loki** stores logs indexed only by those labels. The full JSON content is searchable at query time using LogQL — no schema needed upfront.
+- **Grafana** connects to both as datasources (auto-provisioned on startup) and is the single UI for exploring logs and metrics.
+
+### Accessing Grafana
+
+Open `http://localhost:3000` in your browser. Log in with the credentials from your `.env` file (`GRAFANA_USER` / `GRAFANA_PASSWORD`, default `admin` / `admin`).
+
+Both datasources (Prometheus and Loki) are provisioned automatically — no manual setup required.
+
+### Searching logs
+
+Go to **Explore** (compass icon in the left sidebar) and select the **Loki** datasource.
+
+**Show all logs from a service:**
+```logql
+{service="payment-api"}
+```
+
+**Filter to a specific instance:**
+```logql
+{service="payment-api", container="payment-api-1"}
+```
+
+**Parse JSON and filter by log level:**
+```logql
+{service="payment-api"} | json | level="ERROR"
+```
+
+**Trace a single request end-to-end across all services:**
+```logql
+{compose_project="loadbalancer"} | json | requestId="a3f1c8..."
+```
+
+This last query is the most powerful one: given a `requestId` from an HTTP response header, it returns every log line produced by Nginx, `payment-api`, and `invoice-api` in the exact order they were emitted — across whichever instances handled the request.
+
+**Show all logs from all services, newest first:**
+```logql
+{compose_project="loadbalancer"} | json
+```
+
+### Viewing metrics
+
+In **Explore**, switch to the **Prometheus** datasource.
+
+**Request rate per instance (last 5 min):**
+```promql
+rate(http_server_requests_seconds_count{service="payment-api"}[5m])
+```
+
+**Check all instances are up:**
+```promql
+up
+```
+
+**JVM heap usage by instance:**
+```promql
+jvm_memory_used_bytes{area="heap", service="payment-api"}
+```
+
+You can also open `http://localhost:9090` to use the Prometheus UI directly and inspect scrape targets under **Status → Targets**.
